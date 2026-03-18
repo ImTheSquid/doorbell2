@@ -1,0 +1,42 @@
+[package]
+name = "doorbell2"
+version = "0.1.0"
+authors = ["Jack Hogan <jackhogan11@gmail.com>"]
+edition = "2021"
+resolver = "2"
+# rust-version = "1.84"
+
+[[bin]]
+name = "doorbell2"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice, and they don't increase the size on Flash
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync", "experimental"] }
+# Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+anyhow = "1.0.102"
+esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", version = "0.1.0", features = ["max-fabrics-2", "std"] }
+static_cell = "2.1.1"
+rand = "=0.8.5"
+rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next", default-features = false }
+
+[build-dependencies]
+embuild = "0.33"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "1.1.0" }
+
+[patch.crates-io]
+#rs-matter = { git = "https://github.com/project-chip/rs-matter" }
+rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next" }
+#rs-matter = { path = "../rs-matter/rs-matter" }
+rs-matter-stack = { git = "https://github.com/sysgrok/rs-matter-stack", branch = "next" }
+#rs-matter-stack = { path = "../rs-matter-stack" }
