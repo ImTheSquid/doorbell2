@@ -44,7 +44,3 @@ CONFIG_LWIP_TCP_WND_DEFAULT=2880
 # Reduce main/system task stacks (main just spawns a thread and joins)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=2048
-
-# Custom partition table
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
