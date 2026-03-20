@@ -54,9 +54,19 @@ impl SolenoidHandler {
             unlock_request,
         }
     }
+
+    fn notify(&self, ctx: &impl rs_matter::dm::HandlerContext) {
+        self.dataver_changed();
+        ctx.notify_attribute_changed(
+            self.endpoint_id,
+            Self::CLUSTER.id,
+            AttributeId::LockState as _,
+        );
+    }
 }
 
 const DEFAULT_FULL_UNLOCK_TIME: Duration = Duration::from_secs(10);
+const FORCE_NOTIFY_INTERVAL: Duration = Duration::from_mins(1);
 
 impl ClusterAsyncHandler for SolenoidHandler {
     #[doc = "The cluster-metadata corresponding to this handler trait."]
@@ -81,6 +91,9 @@ impl ClusterAsyncHandler for SolenoidHandler {
         &self,
         ctx: impl rs_matter::dm::HandlerContext,
     ) -> Result<(), rs_matter::error::Error> {
+        self.notify(&ctx);
+        let mut last_force_notify = Instant::now();
+
         loop {
             // Check for external unlock requests (e.g. from WebSocket)
             if self.unlock_request.swap(false, Ordering::Relaxed) {
@@ -105,16 +118,16 @@ impl ClusterAsyncHandler for SolenoidHandler {
             if let Ok(ref mut itm) = self.relays.try_borrow_mut() {
                 let is_changed = itm.0.get_level() != new_relay_state;
                 if is_changed {
-                    self.dataver_changed();
-                    ctx.notify_attribute_changed(
-                        self.endpoint_id,
-                        Self::CLUSTER.id,
-                        AttributeId::LockState as _,
-                    );
+                    self.notify(&ctx);
                 }
 
                 itm.0.set_level(new_relay_state).expect("set relay A");
                 itm.1.set_level(new_relay_state).expect("set relay B");
+            }
+
+            if last_force_notify.elapsed() >= FORCE_NOTIFY_INTERVAL {
+                self.notify(&ctx);
+                last_force_notify = Instant::now();
             }
 
             Timer::after_millis(100).await;

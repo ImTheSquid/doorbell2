@@ -27,20 +27,20 @@ use esp_idf_svc::io::vfs::MountedEventfs;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::timer::EspTaskTimerService;
 
-use log::{error, info, warn};
+use log::{error, info};
 
 use rs_matter::crypto::{CryptoSensitive, CryptoSensitiveRef};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::BasicCommData;
 use static_cell::StaticCell;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 const STACK_SIZE: usize = 36 * 1024;
 const BLUETOOTH_STACK_SIZE: usize = 20 * 1024;
 
 /// WebSocket server URI to connect to for external unlock commands
-const WS_SERVER_URI: &str = "ws://192.168.68.1:8080";
+// const WS_SERVER_URI: &str = "ws://192.168.68.1:8080";
 
 pub const DEVICE_CONFIG: BasicInfoConfig = BasicInfoConfig {
     vid: 0xdead,
@@ -184,7 +184,10 @@ async fn matter() -> Result<(), anyhow::Error> {
         // Our `AsyncHandler` + `AsyncMetadata` impl
         (NODE, handler),
         // Tune WiFi for stability with BLE coex, then start WebSocket client
-        WifiStabilityTask { stack, unlock_request },
+        WifiStabilityTask {
+            stack,
+            _unlock_request: unlock_request
+        },
     ));
 
     let mut led = PinDriver::output(peripherals.pins.gpio23).expect("GPIO 23 init");
@@ -206,7 +209,7 @@ static MATTER_STACK: StaticCell<EspWifiMatterStack<BLUETOOTH_STACK_SIZE, ()>> = 
 /// before shutting down BLE to free the shared radio.
 struct WifiStabilityTask {
     stack: &'static EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>,
-    unlock_request: Arc<AtomicBool>,
+    _unlock_request: Arc<AtomicBool>,
 }
 
 impl UserTask for WifiStabilityTask {
@@ -253,46 +256,47 @@ impl UserTask for WifiStabilityTask {
         }
         info!("BLE shutdown complete, WiFi has exclusive radio access");
 
-        // Start WebSocket client to listen for external unlock commands
-        info!("Connecting to WebSocket server: {}", WS_SERVER_URI);
-        let unlock = self.unlock_request.clone();
-        let _ws_client = esp_idf_svc::ws::client::EspWebSocketClient::new(
-            WS_SERVER_URI,
-            &esp_idf_svc::ws::client::EspWebSocketClientConfig::default(),
-            core::time::Duration::from_secs(10),
-            move |event| {
-                if let Ok(event) = event {
-                    match event.event_type {
-                        esp_idf_svc::ws::client::WebSocketEventType::Connected => {
-                            info!("WebSocket connected");
-                        }
-                        esp_idf_svc::ws::client::WebSocketEventType::Disconnected => {
-                            warn!("WebSocket disconnected");
-                        }
-                        esp_idf_svc::ws::client::WebSocketEventType::Text(text) => {
-                            info!("WebSocket received: {}", text);
-                            if text == "open" {
-                                info!("WebSocket: unlock command received");
-                                unlock.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            },
-        );
+        // // Start WebSocket client to listen for external unlock commands
+        // info!("Connecting to WebSocket server: {}", WS_SERVER_URI);
+        // let unlock = self.unlock_request.clone();
+        // let _ws_client = esp_idf_svc::ws::client::EspWebSocketClient::new(
+        //     WS_SERVER_URI,
+        //     &esp_idf_svc::ws::client::EspWebSocketClientConfig::default(),
+        //     core::time::Duration::from_secs(10),
+        //     move |event| {
+        //         if let Ok(event) = event {
+        //             match event.event_type {
+        //                 esp_idf_svc::ws::client::WebSocketEventType::Connected => {
+        //                     info!("WebSocket connected");
+        //                 }
+        //                 esp_idf_svc::ws::client::WebSocketEventType::Disconnected => {
+        //                     warn!("WebSocket disconnected");
+        //                 }
+        //                 esp_idf_svc::ws::client::WebSocketEventType::Text(text) => {
+        //                     info!("WebSocket received: {}", text);
+        //                     if text == "open" {
+        //                         info!("WebSocket: unlock command received");
+        //                         unlock.store(true, Ordering::Relaxed);
+        //                     }
+        //                 }
+        //                 _ => {}
+        //             }
+        //         }
+        //     },
+        // );
 
-        match _ws_client {
-            Ok(_client) => {
-                info!("WebSocket client started");
-                // Keep the client alive by holding it in scope while we await forever
-                core::future::pending().await
-            }
-            Err(e) => {
-                error!("Failed to start WebSocket client: {:?}", e);
-                core::future::pending().await
-            }
-        }
+        // match _ws_client {
+        //     Ok(_client) => {
+        //         info!("WebSocket client started");
+        //         // Keep the client alive by holding it in scope while we await forever
+        //         core::future::pending().await
+        //     }
+        //     Err(e) => {
+        //         error!("Failed to start WebSocket client: {:?}", e);
+        //         core::future::pending().await
+        //     }
+        // }
+        core::future::pending().await
     }
 }
 
