@@ -296,7 +296,15 @@ impl UserTask for WifiStabilityTask {
         //         core::future::pending().await
         //     }
         // }
-        core::future::pending().await
+
+        // The device becomes unresponsive to HomeKit every 40ish hours
+        // Restart every 24 hours to hopefully prevent this
+        info!("Scheduled automatic reboot in 24 hours");
+        embassy_time::Timer::after_secs(24 * 60 * 60).await;
+        info!("24 hours elapsed, rebooting...");
+        unsafe {
+            esp_idf_svc::sys::esp_restart();
+        }
     }
 }
 
