@@ -65,7 +65,7 @@ impl SolenoidHandler {
     }
 }
 
-const DEFAULT_FULL_UNLOCK_TIME: Duration = Duration::from_secs(10);
+const DEFAULT_FULL_UNLOCK_TIME: Duration = Duration::from_secs(5);
 const FORCE_NOTIFY_INTERVAL: Duration = Duration::from_mins(1);
 
 impl ClusterAsyncHandler for SolenoidHandler {

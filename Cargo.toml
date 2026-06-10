@@ -27,6 +27,7 @@ esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", versio
 static_cell = "2.1.1"
 rand = "=0.8.5"
 rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next", default-features = false }
+chrono = "0.4.45"
 
 [build-dependencies]
 embuild = "0.33"

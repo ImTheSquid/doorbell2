@@ -2,6 +2,7 @@ use core::pin::pin;
 
 use std::sync::Arc;
 
+use chrono::{Days, NaiveTime, Utc};
 use doorbell2::door_lock::{self, ClusterAsyncHandler};
 use doorbell2::SolenoidHandler;
 use esp_idf_matter::init_async_io;
@@ -298,10 +299,19 @@ impl UserTask for WifiStabilityTask {
         // }
 
         // The device becomes unresponsive to HomeKit every 40ish hours
-        // Restart every 24 hours to hopefully prevent this
-        info!("Scheduled automatic reboot in 24 hours");
-        embassy_time::Timer::after_secs(24 * 60 * 60).await;
-        info!("24 hours elapsed, rebooting...");
+        // Restart every 24 hours to hopefully prevent this=
+        info!("Scheduled automatic reboot at midnight");
+        let now = Utc::now();
+        let reboot_point = now
+            .checked_add_days(Days::new(1))
+            .expect("date add")
+            .with_time(NaiveTime::from_hms_opt(7, 0, 0).expect("valid time"))
+            .latest()
+            .expect("valid time late");
+        while Utc::now() < reboot_point {
+            embassy_time::Timer::after_secs(1).await;
+        }
+        info!("Scheduled time passed, rebooting...");
         unsafe {
             esp_idf_svc::sys::esp_restart();
         }
