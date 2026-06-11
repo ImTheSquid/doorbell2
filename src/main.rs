@@ -2,7 +2,8 @@ use core::pin::pin;
 
 use std::sync::Arc;
 
-use chrono::{Days, NaiveTime, Utc};
+use chrono::{Datelike, TimeZone, Utc};
+use chrono_tz::America::Los_Angeles;
 use doorbell2::door_lock::{self, ClusterAsyncHandler};
 use doorbell2::SolenoidHandler;
 use esp_idf_matter::init_async_io;
@@ -28,12 +29,11 @@ use esp_idf_svc::io::vfs::MountedEventfs;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::timer::EspTaskTimerService;
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use rs_matter::crypto::{CryptoSensitive, CryptoSensitiveRef};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::BasicCommData;
-use static_cell::StaticCell;
 
 use std::sync::atomic::AtomicBool;
 
@@ -102,8 +102,13 @@ fn run() -> Result<(), anyhow::Error> {
 async fn matter() -> Result<(), anyhow::Error> {
     // Initialize the Matter stack (can be done only once),
     // as we'll run it in this thread
-    let stack = MATTER_STACK
-        .uninit()
+    // Heap-allocate the ~64 KB Matter stack instead of putting it in static
+    // `.bss`. Static DRAM (`dram0_0_seg`) is only ~124 KB on this ESP32 after
+    // the BT controller's reservation, and this buffer alone is over half of it;
+    // the runtime heap is far larger. `new_uninit` allocates straight on the
+    // heap with no 64 KB stack temporary, and `Box::leak` gives it the `'static`
+    // lifetime the WifiBle stack requires.
+    let stack = Box::leak(Box::<EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>>::new_uninit())
         .init_with(EspWifiMatterStack::init_default(
             &DEVICE_CONFIG,
             BasicCommData {
@@ -200,11 +205,6 @@ async fn matter() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// The Matter stack is allocated statically to avoid
-/// program stack blowups.
-/// It is also a mandatory requirement when the `WifiBle` stack variation is used.
-static MATTER_STACK: StaticCell<EspWifiMatterStack<BLUETOOTH_STACK_SIZE, ()>> = StaticCell::new();
-
 /// Tunes WiFi for stability when coexisting with BLE on ESP32's shared radio.
 /// Disables WiFi PS immediately, then polls for commissioning completion
 /// before shutting down BLE to free the shared radio.
@@ -298,20 +298,67 @@ impl UserTask for WifiStabilityTask {
         //     }
         // }
 
-        // The device becomes unresponsive to HomeKit every 40ish hours
-        // Restart every 24 hours to hopefully prevent this=
-        info!("Scheduled automatic reboot at midnight");
-        let now = Utc::now();
-        let reboot_point = now
-            .checked_add_days(Days::new(1))
-            .expect("date add")
-            .with_time(NaiveTime::from_hms_opt(7, 0, 0).expect("valid time"))
-            .latest()
-            .expect("valid time late");
+        // The device becomes unresponsive to HomeKit every 40ish hours.
+        // Sync the clock over SNTP, then reboot at the nearest upcoming
+        // Pacific midnight (a quiet hour) to clear the hang before it happens.
+        info!("Starting SNTP time sync");
+        let synced = match esp_idf_svc::sntp::EspSntp::new_default() {
+            Ok(sntp) => {
+                // Block (bounded) until SNTP has actually set the system clock.
+                // Without this, Utc::now() returns 1970 and "midnight" is bogus.
+                let mut waited_secs = 0u32;
+                while sntp.get_sync_status() != esp_idf_svc::sntp::SyncStatus::Completed {
+                    if waited_secs >= 120 {
+                        warn!("SNTP did not sync within 120s; using fallback reboot timer");
+                        break;
+                    }
+                    embassy_time::Timer::after_secs(1).await;
+                    waited_secs += 1;
+                }
+                // Keep `sntp` alive for the rest of the task; dropping it stops sync.
+                core::mem::forget(sntp);
+                Utc::now().year() >= 2025
+            }
+            Err(e) => {
+                error!("Failed to start SNTP: {e:?}");
+                false
+            }
+        };
+
+        let reboot_point = if synced {
+            // Nearest upcoming midnight in America/Los_Angeles, DST-aware.
+            // Midnight never falls in a DST transition (those happen at 02:00),
+            // so the local time is always unambiguous.
+            let now_pacific = Utc::now().with_timezone(&Los_Angeles);
+            let next_date = now_pacific
+                .date_naive()
+                .succ_opt()
+                .expect("date has a successor");
+            let next_midnight = next_date
+                .and_hms_opt(0, 0, 0)
+                .expect("00:00:00 is valid");
+            let point = Los_Angeles
+                .from_local_datetime(&next_midnight)
+                .single()
+                .expect("midnight is unambiguous")
+                .with_timezone(&Utc);
+            info!(
+                "Scheduling reboot at next Pacific midnight: {} Pacific ({} UTC)",
+                next_midnight, point
+            );
+            point
+        } else {
+            // Clock never synced: fall back to a relative 24h timer. This still
+            // works with an unsynced (1970-based) clock since both sides of the
+            // comparison use the same monotonic-from-boot system time.
+            warn!("Clock unsynced; falling back to reboot ~24h from now");
+            Utc::now() + chrono::Duration::hours(24)
+        };
+
         while Utc::now() < reboot_point {
-            embassy_time::Timer::after_secs(1).await;
+            embassy_time::Timer::after_secs(60).await;
         }
-        info!("Scheduled time passed, rebooting...");
+        info!("Scheduled time reached, rebooting...");
         unsafe {
             esp_idf_svc::sys::esp_restart();
         }

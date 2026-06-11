@@ -28,6 +28,9 @@ static_cell = "2.1.1"
 rand = "=0.8.5"
 rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next", default-features = false }
 chrono = "0.4.45"
+# `filter-by-regex` keeps only the zones matched by CHRONO_TZ_TIMEZONE_FILTER
+# (see .cargo/config.toml) so we don't flash the entire IANA tz database.
+chrono-tz = { version = "0.10", features = ["filter-by-regex"] }
 
 [build-dependencies]
 embuild = "0.33"
