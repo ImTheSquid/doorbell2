@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::{Datelike, TimeZone, Utc};
 use chrono_tz::America::Los_Angeles;
 use doorbell2::door_lock::{self, ClusterAsyncHandler};
-use doorbell2::SolenoidHandler;
+use doorbell2::{run_status_led, NetStatus, SolenoidHandler};
 use esp_idf_matter::init_async_io;
 use esp_idf_matter::matter::crypto::{default_crypto, Crypto};
 use esp_idf_matter::matter::dm::clusters::desc::{self, ClusterHandler as _, DescHandler};
@@ -35,7 +35,7 @@ use rs_matter::crypto::{CryptoSensitive, CryptoSensitiveRef};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::BasicCommData;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 const STACK_SIZE: usize = 36 * 1024;
 const BLUETOOTH_STACK_SIZE: usize = 20 * 1024;
@@ -108,17 +108,18 @@ async fn matter() -> Result<(), anyhow::Error> {
     // the runtime heap is far larger. `new_uninit` allocates straight on the
     // heap with no 64 KB stack temporary, and `Box::leak` gives it the `'static`
     // lifetime the WifiBle stack requires.
-    let stack = Box::leak(Box::<EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>>::new_uninit())
-        .init_with(EspWifiMatterStack::init_default(
-            &DEVICE_CONFIG,
-            BasicCommData {
-                password: CryptoSensitive::new_from_ref(CryptoSensitiveRef::new(
-                    &31415926_u32.to_le_bytes(),
-                )),
-                discriminator: 1229,
-            },
-            &TEST_DEV_ATT,
-        ));
+    let stack =
+        Box::leak(Box::<EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>>::new_uninit())
+            .init_with(EspWifiMatterStack::init_default(
+                &DEVICE_CONFIG,
+                BasicCommData {
+                    password: CryptoSensitive::new_from_ref(CryptoSensitiveRef::new(
+                        &31415926_u32.to_le_bytes(),
+                    )),
+                    discriminator: 1229,
+                },
+                &TEST_DEV_ATT,
+            ));
 
     // Take some generic ESP-IDF stuff we'll need later
     let sysloop = EspSystemEventLoop::take()?;
@@ -138,6 +139,10 @@ async fn matter() -> Result<(), anyhow::Error> {
     let mut good_rand = crypto.rand()?;
 
     let unlock_request = Arc::new(AtomicBool::new(false));
+
+    // Connectivity phase surfaced on the GPIO23 status LED (updated by
+    // `WifiStabilityTask`). Lock state has its own dedicated LEDs on the board.
+    let net_status = Arc::new(AtomicU8::new(NetStatus::Booting as u8));
 
     let solenoid = SolenoidHandler::new(
         Dataver::new_rand(&mut good_rand),
@@ -179,8 +184,7 @@ async fn matter() -> Result<(), anyhow::Error> {
         .await?;
 
     // Run the Matter stack with our handler
-    // Using `pin!` is completely optional, but reduces the size of the final future
-    let matter = pin!(stack.run_coex(
+    let matter = stack.run_coex(
         // The Matter stack needs the Wifi/BLE modem peripheral
         EspMatterWifi::new_with_builtin_mdns(peripherals.modem, sysloop, timers, nvs, stack),
         // The Matter stack needs a persister to store its state
@@ -189,18 +193,24 @@ async fn matter() -> Result<(), anyhow::Error> {
         &crypto,
         // Our `AsyncHandler` + `AsyncMetadata` impl
         (NODE, handler),
-        // Tune WiFi for stability with BLE coex, then start WebSocket client
+        // Tune WiFi for stability with BLE coex, reporting phase on the LED
         WifiStabilityTask {
             stack,
-            _unlock_request: unlock_request
+            _unlock_request: unlock_request,
+            net_status: net_status.clone(),
         },
-    ));
+    );
 
-    let mut led = PinDriver::output(peripherals.pins.gpio23).expect("GPIO 23 init");
-    led.set_high().expect("LED high");
+    let led = PinDriver::output(peripherals.pins.gpio23).expect("GPIO 23 init");
+    let led_task = run_status_led(led, net_status.clone());
 
-    // Run Matter
-    matter.await?;
+    // Run Matter and the status-LED driver concurrently. `led_task` loops
+    // forever; only the Matter future can finish (on error), so propagate that.
+    // `pin!` keeps the (large) Matter future off the stack as it did before.
+    match embassy_futures::select::select(pin!(matter), pin!(led_task)).await {
+        embassy_futures::select::Either::First(res) => res?,
+        embassy_futures::select::Either::Second(()) => {}
+    }
 
     Ok(())
 }
@@ -211,6 +221,8 @@ async fn matter() -> Result<(), anyhow::Error> {
 struct WifiStabilityTask {
     stack: &'static EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>,
     _unlock_request: Arc<AtomicBool>,
+    /// Shared phase indicator driving the status LED.
+    net_status: Arc<AtomicU8>,
 }
 
 impl UserTask for WifiStabilityTask {
@@ -219,6 +231,10 @@ impl UserTask for WifiStabilityTask {
         S: nal::NetStack,
         N: rs_matter::dm::clusters::gen_diag::NetifDiag + rs_matter::dm::networks::NetChangeNotif,
     {
+        // Matter needs a responsive link. WiFi's default is modem-sleep power save
+        // (`pm start, type: 1`), which drops/delays UDP and makes commissioning
+        // joins flaky — disable it as early as possible. (Coex preference is set
+        // later, once the commissioning network is up.)
         unsafe {
             info!("Disabling WiFi power save");
             esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE);
@@ -226,6 +242,32 @@ impl UserTask for WifiStabilityTask {
 
         let commissioned = self.stack.matter().is_commissioned();
         info!("Commissioned state at UserTask start: {}", commissioned);
+
+        // Definitive readout of *why* we're (un)commissioned: `is_commissioned()`
+        // is just "fabric count > 0", so dump the actual fabrics. A previously
+        // paired device showing 0 fabrics here means it lost/never persisted its
+        // fabric (vs. just failing to connect).
+        {
+            let matter = self.stack.matter();
+            let fabrics = matter.fabric_mgr.borrow();
+            info!("Persisted fabric count: {}", fabrics.iter().count());
+            for fabric in fabrics.iter() {
+                info!(
+                    "  fabric idx={} fabric_id={:#x} node_id={:#x} label={:?}",
+                    fabric.fab_idx(),
+                    fabric.fabric_id(),
+                    fabric.node_id(),
+                    fabric.label(),
+                );
+            }
+        }
+
+        // Already paired -> we're just reconnecting WiFi; otherwise advertise.
+        if commissioned {
+            NetStatus::WifiConnecting.store(&self.net_status);
+        } else {
+            NetStatus::Commissioning.store(&self.net_status);
+        }
 
         if !commissioned {
             info!("Waiting for commissioning to complete...");
@@ -241,21 +283,29 @@ impl UserTask for WifiStabilityTask {
             // Commissioned — wait for one more netif change so the WiFi credentials
             // exchange over BLE completes and WiFi actually connects
             info!("Commissioned, waiting for WiFi to connect...");
+            NetStatus::WifiConnecting.store(&self.net_status);
             netif.wait_changed().await;
         }
 
-        info!("Shutting down BLE to stabilize WiFi");
+        // Fully tear BLE down (not just deprioritize coex). The commissioner has
+        // the WiFi creds by now and finishes over CASE/WiFi, so BLE is no longer
+        // needed — and keeping the controller + bluedroid resident holds tens of
+        // KB of RAM. That RAM is needed for the WiFi/LWIP TX path: the post-CASE
+        // subscription ReportData burst to Apple's two fabrics is large, and with
+        // BLE still resident the sends fail with ENOMEM ("Not enough space"),
+        // stalling commissioning. Tearing BLE down frees that memory.
+        info!("Shutting down BLE to stabilize WiFi and free memory");
         unsafe {
             esp_idf_svc::sys::esp_bluedroid_disable();
             esp_idf_svc::sys::esp_bluedroid_deinit();
             esp_idf_svc::sys::esp_bt_controller_disable();
             esp_idf_svc::sys::esp_bt_controller_deinit();
-
             esp_idf_svc::sys::esp_coex_preference_set(
                 esp_idf_svc::sys::esp_coex_prefer_t_ESP_COEX_PREFER_WIFI,
             );
         }
         info!("BLE shutdown complete, WiFi has exclusive radio access");
+        NetStatus::Online.store(&self.net_status);
 
         // // Start WebSocket client to listen for external unlock commands
         // info!("Connecting to WebSocket server: {}", WS_SERVER_URI);
@@ -301,29 +351,82 @@ impl UserTask for WifiStabilityTask {
         // The device becomes unresponsive to HomeKit every 40ish hours.
         // Sync the clock over SNTP, then reboot at the nearest upcoming
         // Pacific midnight (a quiet hour) to clear the hang before it happens.
-        info!("Starting SNTP time sync");
-        let synced = match esp_idf_svc::sntp::EspSntp::new_default() {
-            Ok(sntp) => {
-                // Block (bounded) until SNTP has actually set the system clock.
-                // Without this, Utc::now() returns 1970 and "midnight" is bogus.
-                let mut waited_secs = 0u32;
-                while sntp.get_sync_status() != esp_idf_svc::sntp::SyncStatus::Completed {
-                    if waited_secs >= 120 {
-                        warn!("SNTP did not sync within 120s; using fallback reboot timer");
-                        break;
+        //
+        // rs-matter times its fail-safe off the wall clock (`sys_epoch`), so a
+        // large forward `settimeofday` step while a fail-safe is armed instantly
+        // expires it and rolls back commissioning. A fail-safe is armed only
+        // during a *fresh* commission. So the one unsafe case is: we booted
+        // uncommissioned (fresh pairing) AND the clock is still bogus (≈1970 — a
+        // cold power-on with no RTC time to carry across the reboot). In that
+        // case a sync would hard-step mid-pairing and kill it, so we defer to the
+        // next boot, which comes up already-commissioned (no fail-safe armed).
+        // This is a plain boolean guard, not a delay. Every other boot syncs.
+        let clock_was_bogus = Utc::now().year() < 2026;
+        let synced = if !commissioned && clock_was_bogus {
+            warn!("Fresh pairing on an unsynced clock; deferring SNTP to the next boot so the clock step can't roll back commissioning");
+            false
+        } else {
+            // Smooth mode slews sub-35-min deltas via `adjtime` instead of
+            // stepping, so an already-timed device's correction never trips the
+            // fail-safe even if one happens to be armed (e.g. a re-commission).
+            // A bogus-clock device here is already commissioned (no fail-safe), so
+            // the unavoidable hard step is harmless.
+            info!("Starting SNTP time sync (smooth mode)");
+            let conf = esp_idf_svc::sntp::SntpConf {
+                sync_mode: esp_idf_svc::sntp::SyncMode::Smooth,
+                ..Default::default()
+            };
+            match esp_idf_svc::sntp::EspSntp::new(&conf) {
+                Ok(sntp) => {
+                    // Block (bounded) until SNTP has actually set the system clock.
+                    let mut waited_secs = 0u32;
+                    while sntp.get_sync_status() != esp_idf_svc::sntp::SyncStatus::Completed {
+                        if waited_secs >= 120 {
+                            warn!("SNTP did not sync within 120s; using fallback reboot timer");
+                            break;
+                        }
+                        embassy_time::Timer::after_secs(1).await;
+                        waited_secs += 1;
                     }
-                    embassy_time::Timer::after_secs(1).await;
-                    waited_secs += 1;
+                    // Keep `sntp` alive for the rest of the task; dropping it stops sync.
+                    core::mem::forget(sntp);
+                    Utc::now().year() >= 2025
                 }
-                // Keep `sntp` alive for the rest of the task; dropping it stops sync.
-                core::mem::forget(sntp);
-                Utc::now().year() >= 2025
-            }
-            Err(e) => {
-                error!("Failed to start SNTP: {e:?}");
-                false
+                Err(e) => {
+                    error!("Failed to start SNTP: {e:?}");
+                    false
+                }
             }
         };
+
+        // If the clock just hard-stepped (only reachable on an already-commissioned
+        // boot — fresh pairings are deferred above), drop now-stale Matter sessions
+        // so peers re-establish CASE with fresh timestamps. No fail-safe is armed
+        // in that case, so this only churns sessions, never fabrics. On this
+        // single-threaded executor `reset_transport` can't race a transport borrow;
+        // the only expected failure is `InvalidState` (packet in flight), retried.
+        if synced && clock_was_bogus {
+            info!(
+                "Clock stepped forward; resetting Matter transport to clear stale session timers"
+            );
+            let mut attempts = 0u32;
+            loop {
+                match self.stack.matter().reset_transport() {
+                    Ok(()) => {
+                        info!("Matter transport reset after clock step");
+                        break;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 10 {
+                            warn!("Could not reset transport after {attempts} attempts: {e:?}");
+                            break;
+                        }
+                        embassy_time::Timer::after_millis(200).await;
+                    }
+                }
+            }
+        }
 
         let reboot_point = if synced {
             // Nearest upcoming midnight in America/Los_Angeles, DST-aware.
@@ -334,9 +437,7 @@ impl UserTask for WifiStabilityTask {
                 .date_naive()
                 .succ_opt()
                 .expect("date has a successor");
-            let next_midnight = next_date
-                .and_hms_opt(0, 0, 0)
-                .expect("00:00:00 is valid");
+            let next_midnight = next_date.and_hms_opt(0, 0, 0).expect("00:00:00 is valid");
             let point = Los_Angeles
                 .from_local_datetime(&next_midnight)
                 .single()

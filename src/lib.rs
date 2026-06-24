@@ -1,4 +1,6 @@
 #![allow(unexpected_cfgs)]
+#![feature(const_ops)]
+#![feature(const_trait_impl)]
 
 use embassy_time::Timer;
 use esp_idf_matter::matter::import;
@@ -7,13 +9,13 @@ import!(DoorLock);
 use std::{
     cell::{Cell, RefCell},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
-use esp_idf_svc::hal::gpio::{InputOutput, Level, PinDriver};
+use esp_idf_svc::hal::gpio::{InputOutput, Level, Output, PinDriver};
 use rs_matter::{
     dm::{Dataver, EndptId},
     tlv::Nullable,
@@ -25,6 +27,73 @@ use crate::door_lock::*;
 enum LockState {
     Locked,
     UnlockedUntil(Instant),
+}
+
+/// Coarse connectivity phase the device is in, surfaced on the status LED so
+/// you can tell *why* the lock isn't responding without attaching a serial
+/// console. Stored as a `u8` in an [`AtomicU8`] shared with [`run_status_led`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NetStatus {
+    /// Firmware is alive but the network stack hasn't reported in yet.
+    Booting = 0,
+    /// Advertising over BLE, waiting to be commissioned (paired).
+    Commissioning = 1,
+    /// Commissioned; bringing up the WiFi connection.
+    WifiConnecting = 2,
+    /// Fully operational: WiFi up, BLE shut down, ready for commands.
+    Online = 3,
+}
+
+impl NetStatus {
+    /// Publish this phase to the shared slot read by [`run_status_led`].
+    pub fn store(self, slot: &AtomicU8) {
+        slot.store(self as u8, Ordering::Relaxed);
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => NetStatus::Commissioning,
+            2 => NetStatus::WifiConnecting,
+            3 => NetStatus::Online,
+            _ => NetStatus::Booting,
+        }
+    }
+}
+
+/// Drives the single status LED forever, translating [`NetStatus`] into distinct
+/// blink patterns so the LED actually says something useful when debugging:
+///
+/// | State            | Pattern                          | Meaning                            |
+/// |------------------|----------------------------------|------------------------------------|
+/// | `Booting`        | solid on                         | powered, network not up yet        |
+/// | `Commissioning`  | mostly on, quick wink off (~1.5s)| waiting to be paired over BLE      |
+/// | `WifiConnecting` | fast blink (~3 Hz)               | paired, joining WiFi               |
+/// | `Online`         | brief blip every 2 s (heartbeat) | running; blip proves it's not hung |
+///
+/// Lock/unlock state is shown by separate dedicated LEDs on the board, so it is
+/// intentionally not surfaced here.
+///
+/// Runs as a normal async task alongside the Matter stack; it samples the shared
+/// state every tick so phase changes show up promptly.
+pub async fn run_status_led(mut led: PinDriver<'static, Output>, net: Arc<AtomicU8>) {
+    const TICK_MS: u64 = 50;
+    let mut t: u64 = 0;
+    loop {
+        let on = match NetStatus::from_u8(net.load(Ordering::Relaxed)) {
+            NetStatus::Booting => true,
+            // Inverse blip: solid on, with a brief 150 ms wink off every 1.5 s.
+            // Reads clearly different from the ~3 Hz WifiConnecting blink so the
+            // two can't be confused at a glance.
+            NetStatus::Commissioning => t % 1500 >= 150,
+            NetStatus::WifiConnecting => (t / 150) % 2 == 0,
+            // One TICK_MS blip at the top of every 2 s window.
+            NetStatus::Online => t % 2000 < TICK_MS,
+        };
+        let _ = led.set_level(if on { Level::High } else { Level::Low });
+        Timer::after_millis(TICK_MS).await;
+        t = t.wrapping_add(TICK_MS);
+    }
 }
 
 pub struct SolenoidHandler {
@@ -66,7 +135,7 @@ impl SolenoidHandler {
 }
 
 const DEFAULT_FULL_UNLOCK_TIME: Duration = Duration::from_secs(5);
-const FORCE_NOTIFY_INTERVAL: Duration = Duration::from_mins(1);
+const FORCE_NOTIFY_INTERVAL: Duration = DEFAULT_FULL_UNLOCK_TIME / 2;
 
 impl ClusterAsyncHandler for SolenoidHandler {
     #[doc = "The cluster-metadata corresponding to this handler trait."]

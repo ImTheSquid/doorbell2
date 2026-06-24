@@ -29,6 +29,14 @@ CONFIG_BT_BLE_RELEASE_CLASSIC_MEMORY=y
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
 CONFIG_PM_ENABLE=n
 
+# This is a Matter station-only device; it never acts as an access point.
+# Leaving SoftAP support on makes esp-idf-svc always create an AP netif
+# (EspWifi::wrap), which a failed STA bring-up can fall into - the driver ends
+# up in AP/APSTA mode, starts a DHCP server on 192.168.71.1, and the connect
+# then fails with NoNetworkInterface. Compiling SoftAP out removes that netif
+# (and the failure mode) entirely, and saves a little memory.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+
 # Reduce WiFi memory footprint (but keep mgmt buffers adequate for WPA3/PMF)
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8

@@ -8,7 +8,7 @@ resolver = "2"
 
 [[bin]]
 name = "doorbell2"
-harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+harness = false    # do not use the built-in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
 opt-level = "s"
@@ -19,11 +19,20 @@ opt-level = "z"
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync", "experimental"] }
+esp-idf-svc = { version = "0.52.1", features = [
+    "critical-section",
+    "embassy-time-driver",
+    "embassy-sync",
+    "experimental",
+] }
 # Remove `generic-queue-8` if you plan to use `embassy-time` WITH `embassy-executor`
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+embassy-futures = "0.1"
 anyhow = "1.0.102"
-esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", version = "0.1.0", features = ["max-fabrics-2", "std"] }
+esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", features = [
+    "max-fabrics-2",
+    "std",
+] }
 static_cell = "2.1.1"
 rand = "=0.8.5"
 rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next", default-features = false }
