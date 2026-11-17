@@ -1,7 +1,6 @@
 mod persist;
 
 use core::pin::pin;
-use embassy_futures::select::{select, select4, Either};
 use embassy_time::Timer;
 
 use persist::MatterBlobStore;
@@ -18,14 +17,15 @@ use esp_idf_matter::init_async_io;
 use esp_idf_matter::matter::crypto::{default_crypto, Crypto};
 use esp_idf_matter::matter::dm::clusters::desc::{self, ClusterHandler as _, DescHandler};
 use esp_idf_matter::matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT};
-use esp_idf_matter::matter::dm::{
-    Async, Dataver, DeviceType, EmptyHandler, Endpoint, EpClMatcher, Node,
-};
+use esp_idf_matter::matter::dm::endpoints::ROOT_ENDPOINT_ID;
+use esp_idf_matter::matter::dm::{Async, Dataver, DeviceType, EmptyHandler, Endpoint, Node};
+use esp_idf_matter::matter::stack::net::NetStack;
+use esp_idf_matter::matter::stack::wireless::BTP_BUMP_SIZE;
+use esp_idf_matter::matter::stack::{MatterStack, UserTask};
+use esp_idf_matter::matter::utils::futures::{select, select4, Coalesce, Either};
 use esp_idf_matter::matter::utils::init::InitMaybeUninit;
-use esp_idf_matter::matter::utils::sync::blocking::raw::StdRawMutex;
-use esp_idf_matter::matter::{clusters, devices};
-use esp_idf_matter::stack::{nal, UserTask};
-use esp_idf_matter::wireless::{EspMatterWifi, EspWifiMatterStack};
+use esp_idf_matter::matter::{clusters, devices, root_endpoint};
+use esp_idf_matter::wireless::{EspMatterWifi, EspWifiNetwork};
 
 use esp_idf_svc::bt::reduce_bt_memory;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -43,20 +43,18 @@ use esp_idf_svc::{
 use rs_matter::{
     dm::{clusters::gen_diag::NetifDiag, networks::NetChangeNotif},
     error::Error as MatterError,
-    transport::session::SessionMode,
-    utils::select::Coalesce,
+    session::SessionMode,
 };
 
 use log::{error, info, warn};
 
-use rs_matter::crypto::{CryptoSensitive, CryptoSensitiveRef};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
-use rs_matter::BasicCommData;
+use rs_matter::pairing::{BasicCommData, Spake2pVerifierPassword, Spake2pVerifierPasswordRef};
 
 const STACK_SIZE: usize = 36 * 1024;
-const BLUETOOTH_STACK_SIZE: usize = 20 * 1024;
+const BUMP_SIZE: usize = 20 * 1024 + BTP_BUMP_SIZE;
 const DIAG_INTERVAL_SECS: u64 = 300;
-type Stack = EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>;
+type Stack = MatterStack<'static, BUMP_SIZE, EspWifiNetwork>;
 
 pub const DEVICE_CONFIG: BasicInfoConfig = BasicInfoConfig {
     vid: 0xdead,
@@ -107,10 +105,10 @@ fn run() -> Result<(), anyhow::Error> {
 
 async fn matter() -> Result<(), anyhow::Error> {
     // Heap allocation avoids exhausting static DRAM; the stack needs a static lifetime.
-    let stack = Box::leak(Box::<Stack>::new_uninit()).init_with(Stack::init_default(
+    let stack = Box::leak(Box::<Stack>::new_uninit()).init_with(Stack::init(
         &DEVICE_CONFIG,
         BasicCommData {
-            password: CryptoSensitive::new_from_ref(CryptoSensitiveRef::new(
+            password: Spake2pVerifierPassword::new_from_ref(Spake2pVerifierPasswordRef::new(
                 &31415926_u32.to_le_bytes(),
             )),
             discriminator: 1229,
@@ -129,16 +127,16 @@ async fn matter() -> Result<(), anyhow::Error> {
     reduce_bt_memory(unsafe { peripherals.modem.reborrow() })
         .expect("bt memory reduction successful");
 
-    let crypto = default_crypto::<StdRawMutex, _>(rand::thread_rng(), DAC_PRIVKEY);
+    let crypto = default_crypto(rand::rng(), DAC_PRIVKEY);
 
-    let mut good_rand = crypto.rand()?;
+    let mut weak_rand = crypto.weak_rand()?;
 
     let unlock_request = Arc::new(AtomicBool::new(false));
 
     let net_status = Arc::new(AtomicU8::new(NetStatus::Booting as u8));
 
     let solenoid = SolenoidHandler::new(
-        Dataver::new_rand(&mut good_rand),
+        Dataver::new_rand(&mut weak_rand),
         SOLENOID_ENDPOINT_ID,
         PinDriver::input_output(peripherals.pins.gpio16, Pull::Down).expect("GPIO 16 init"),
         PinDriver::input_output(peripherals.pins.gpio17, Pull::Down).expect("GPIO 17 init"),
@@ -147,28 +145,28 @@ async fn matter() -> Result<(), anyhow::Error> {
 
     let handler = EmptyHandler
         .chain(
-            EpClMatcher::new(
-                Some(SOLENOID_ENDPOINT_ID),
-                Some(SolenoidHandler::CLUSTER.id),
-            ),
+            |e, _| e == ROOT_ENDPOINT_ID,
+            Async(Stack::root_handler(stack.matter(), &(), &mut weak_rand)),
+        )
+        .chain(
+            |e, c| e == SOLENOID_ENDPOINT_ID && c == SolenoidHandler::CLUSTER.id,
             door_lock::HandlerAsyncAdaptor(&solenoid),
         )
         .chain(
-            EpClMatcher::new(Some(SOLENOID_ENDPOINT_ID), Some(DescHandler::CLUSTER.id)),
-            Async(desc::DescHandler::new(Dataver::new_rand(&mut good_rand)).adapt()),
+            |e, c| e == SOLENOID_ENDPOINT_ID && c == DescHandler::CLUSTER.id,
+            Async(desc::DescHandler::new(Dataver::new_rand(&mut weak_rand)).adapt()),
         );
 
-    let persist = stack
-        .create_persist_with_comm_window(&crypto, MatterBlobStore::new(nvs.clone())?)
-        .await?;
+    let mut store = MatterBlobStore::new(nvs.clone())?;
+    stack.startup(&crypto, &mut store).await?;
     // Capture restored state before commissioning can change the fabric table.
-    let had_fabric_at_start = stack.matter().is_commissioned();
+    let had_fabric_at_start = stack.matter().has_fabrics();
 
-    let matter = stack.run_coex(
+    let matter = stack.run_wifi(
         EspMatterWifi::new_with_builtin_mdns(peripherals.modem, sysloop, timers, nvs, stack),
-        &persist,
         &crypto,
-        (NODE, handler),
+        (NODE, &handler),
+        stack.kv(&mut store),
         WifiStabilityTask {
             stack,
             had_fabric_at_start,
@@ -196,7 +194,7 @@ struct WifiStabilityTask {
 impl UserTask for WifiStabilityTask {
     async fn run<S, N>(&mut self, _net_stack: S, netif: N) -> Result<(), MatterError>
     where
-        S: nal::NetStack,
+        S: NetStack,
         N: NetifDiag + NetChangeNotif,
     {
         info!("Disabling WiFi power save");
@@ -207,11 +205,9 @@ impl UserTask for WifiStabilityTask {
 
         info!("Fabric restored at startup: {}", self.had_fabric_at_start);
 
-        {
-            let matter = self.stack.matter();
-            let fabrics = matter.fabric_mgr.borrow();
-            info!("Current fabric count: {}", fabrics.iter().count());
-            for fabric in fabrics.iter() {
+        self.stack.matter().with_state(|state| {
+            info!("Current fabric count: {}", state.fabrics.iter().count());
+            for fabric in state.fabrics.iter() {
                 info!(
                     "  fabric idx={} fabric_id={:#x} node_id={:#x} label={:?}",
                     fabric.fab_idx(),
@@ -220,7 +216,7 @@ impl UserTask for WifiStabilityTask {
                     fabric.label(),
                 );
             }
-        }
+        });
 
         select4(
             self.monitor_connectivity(&netif),
@@ -234,12 +230,18 @@ impl UserTask for WifiStabilityTask {
 }
 
 impl WifiStabilityTask {
-    /// A fabric alone does not prove commissioning finished: an expired
-    /// fail-safe leaves its fabric behind. A CASE session means a controller
-    /// reached us over WiFi, so BLE is no longer needed.
+    /// A CASE session means a controller reached us over WiFi. The stack runs
+    /// the BLE peripheral while a self-opened commissioning window is open, so
+    /// wait for that to close too: the stack has then stopped advertising.
     async fn manage_ble(&self) -> Result<(), MatterError> {
         info!("Keeping BLE up until a controller connects over CASE");
-        while !self.has_case_session() {
+        while !self.has_case_session()
+            || self
+                .stack
+                .matter()
+                .comm_window_state()
+                .is_open_on_all_transports()
+        {
             Timer::after_millis(200).await;
         }
         shutdown_ble();
@@ -247,9 +249,9 @@ impl WifiStabilityTask {
         // BLE cannot come back without a reboot, which re-pairing needs.
         loop {
             Timer::after_secs(5).await;
-            if !self.stack.matter().is_commissioned() {
+            if !self.stack.matter().has_fabrics() {
                 warn!("No fabrics left; rebooting to re-enable BLE commissioning");
-                // Let the persister save the removal first.
+                // Let the RemoveFabric response go out first.
                 Timer::after_secs(5).await;
                 unsafe { sys::esp_restart() };
             }
@@ -257,13 +259,11 @@ impl WifiStabilityTask {
     }
 
     fn has_case_session(&self) -> bool {
-        self.stack
-            .matter()
-            .transport_mgr
-            .session_mgr
-            .borrow()
-            .iter()
-            .any(|s| matches!(s.get_session_mode(), SessionMode::Case { .. }))
+        self.stack.matter().with_state(|state| {
+            state.sessions.iter().any(|s| {
+                !s.is_reserved() && matches!(s.get_session_mode(), SessionMode::Case { .. })
+            })
+        })
     }
 
     async fn log_diagnostics(&self) -> Result<(), MatterError> {
@@ -273,26 +273,26 @@ impl WifiStabilityTask {
             let mut ap: sys::wifi_ap_record_t = unsafe { core::mem::zeroed() };
             let rssi = (unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) } == sys::ESP_OK)
                 .then_some(ap.rssi);
-            let matter = self.stack.matter();
-            let sessions = matter.transport_mgr.session_mgr.borrow();
-            info!(
-                "diag: uptime={}s heap_free={} heap_min={} heap_largest={} fabrics={} sessions={} rssi={:?}",
-                unsafe { sys::esp_timer_get_time() } / 1_000_000,
-                unsafe { sys::esp_get_free_heap_size() },
-                unsafe { sys::esp_get_minimum_free_heap_size() },
-                unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) },
-                matter.fabric_mgr.borrow().iter().count(),
-                sessions.iter().count(),
-                rssi,
-            );
-            for s in sessions.iter().filter(|s| s.is_encrypted()) {
+            self.stack.matter().with_state(|state| {
                 info!(
-                    "diag:   session fab={} peer={:?} addr={}",
-                    s.get_local_fabric_idx(),
-                    s.get_peer_node_id(),
-                    s.get_peer_addr(),
+                    "diag: uptime={}s heap_free={} heap_min={} heap_largest={} fabrics={} sessions={} rssi={:?}",
+                    unsafe { sys::esp_timer_get_time() } / 1_000_000,
+                    unsafe { sys::esp_get_free_heap_size() },
+                    unsafe { sys::esp_get_minimum_free_heap_size() },
+                    unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) },
+                    state.fabrics.iter().count(),
+                    state.sessions.iter().count(),
+                    rssi,
                 );
-            }
+                for s in state.sessions.iter().filter(|s| s.is_encrypted()) {
+                    info!(
+                        "diag:   session fab={} peer={:?} addr={}",
+                        s.get_local_fabric_idx(),
+                        s.get_peer_node_id(),
+                        s.get_peer_addr(),
+                    );
+                }
+            });
         }
     }
 
@@ -307,7 +307,7 @@ impl WifiStabilityTask {
                     info.operational && info.ipv6_addrs.iter().any(|addr| !addr.is_unspecified());
                 Ok(())
             })?;
-            NetStatus::from_link(self.stack.matter().is_commissioned(), link_ready)
+            NetStatus::from_link(self.stack.matter().has_fabrics(), link_ready)
                 .store(&self.net_status);
 
             // Fabric changes need not emit network events.
@@ -401,17 +401,16 @@ impl WifiStabilityTask {
 const SOLENOID_ENDPOINT_ID: u16 = 1;
 
 const NODE: Node = Node {
-    id: 0,
     endpoints: &[
-        EspWifiMatterStack::<0, ()>::root_endpoint(),
-        Endpoint {
-            id: SOLENOID_ENDPOINT_ID,
-            device_types: devices!(DeviceType {
+        root_endpoint!(wifi),
+        Endpoint::new(
+            SOLENOID_ENDPOINT_ID,
+            devices!(DeviceType {
                 dtype: 0xA,
                 drev: 3
             }),
-            clusters: clusters!(SolenoidHandler::CLUSTER, DescHandler::CLUSTER),
-        },
+            clusters!(SolenoidHandler::CLUSTER, DescHandler::CLUSTER),
+        ),
     ],
 };
 
