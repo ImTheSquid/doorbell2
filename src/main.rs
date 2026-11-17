@@ -299,9 +299,12 @@ impl WifiStabilityTask {
         }
     }
 
+    /// Polls the cached netif state. Never call `netif.wait_changed()` here: it
+    /// wakes only the first waiter to see a change, which would starve the
+    /// stack's own netif task and leave mDNS unpublished.
     async fn monitor_connectivity<N>(&self, netif: &N) -> Result<(), MatterError>
     where
-        N: NetifDiag + NetChangeNotif,
+        N: NetifDiag,
     {
         loop {
             let mut link_ready = false;
@@ -313,8 +316,7 @@ impl WifiStabilityTask {
             NetStatus::from_link(self.stack.matter().has_fabrics(), link_ready)
                 .store(&self.net_status);
 
-            // Fabric changes need not emit network events.
-            select(netif.wait_changed(), Timer::after_millis(250)).await;
+            Timer::after_millis(250).await;
         }
     }
 
