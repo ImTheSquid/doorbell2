@@ -19,7 +19,7 @@ opt-level = "z"
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.52.1", features = [
+esp-idf-svc = { version = "0.53", features = [
     "critical-section",
     "embassy-time-driver",
     "embassy-sync",
@@ -29,13 +29,14 @@ esp-idf-svc = { version = "0.52.1", features = [
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 embassy-futures = "0.1"
 anyhow = "1.0.102"
-esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", features = [
+esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", rev = "66da934579aa", features = [
     "max-fabrics-2",
-    "std",
+    "max-subscriptions-6",
+    "max-im-buffers-16",
 ] }
 static_cell = "2.1.1"
-rand = "=0.8.5"
-rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next", default-features = false }
+rand = "0.10"
+rs-matter = { version = "0.4", default-features = false }
 chrono = "0.4.45"
 # `filter-by-regex` keeps only the zones matched by CHRONO_TZ_TIMEZONE_FILTER
 # (see .cargo/config.toml) so we don't flash the entire IANA tz database.
@@ -48,8 +49,8 @@ embuild = "0.33"
 remote_component = { name = "espressif/esp_websocket_client", version = "1.1.0" }
 
 [patch.crates-io]
-#rs-matter = { git = "https://github.com/project-chip/rs-matter" }
-rs-matter = { git = "https://github.com/sysgrok/rs-matter", branch = "next" }
-#rs-matter = { path = "../rs-matter/rs-matter" }
-rs-matter-stack = { git = "https://github.com/sysgrok/rs-matter-stack", branch = "next" }
-#rs-matter-stack = { path = "../rs-matter-stack" }
+# Mirrors esp-idf-matter 66da934's patches, at the revs it was built against.
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "95e41108f0a0" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf", rev = "0a4d972bfa33" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf", rev = "0a4d972bfa33" }
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf", rev = "0a4d972bfa33" }
