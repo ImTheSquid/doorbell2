@@ -51,7 +51,8 @@ use log::{error, info, warn};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::pairing::{BasicCommData, Spake2pVerifierPassword, Spake2pVerifierPasswordRef};
 
-const STACK_SIZE: usize = 36 * 1024;
+// Futures live in the bump allocator; this holds only call frames and RustCrypto temporaries.
+const STACK_SIZE: usize = 20 * 1024;
 const BUMP_SIZE: usize = 20 * 1024 + BTP_BUMP_SIZE;
 const DIAG_INTERVAL_SECS: u64 = 300;
 type Stack = MatterStack<'static, BUMP_SIZE, EspWifiNetwork>;
@@ -274,11 +275,12 @@ impl WifiStabilityTask {
                 .then_some(ap.rssi);
             self.stack.matter().with_state(|state| {
                 info!(
-                    "diag: uptime={}s heap_free={} heap_min={} heap_largest={} fabrics={} sessions={} rssi={:?}",
+                    "diag: uptime={}s heap_free={} heap_min={} heap_largest={} stack_min={} fabrics={} sessions={} rssi={:?}",
                     unsafe { sys::esp_timer_get_time() } / 1_000_000,
                     unsafe { sys::esp_get_free_heap_size() },
                     unsafe { sys::esp_get_minimum_free_heap_size() },
                     unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) },
+                    unsafe { sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) },
                     state.fabrics.iter().count(),
                     state.sessions.iter().count(),
                     rssi,
