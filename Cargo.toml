@@ -32,6 +32,7 @@ anyhow = "1.0.102"
 esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", features = [
     "max-fabrics-2",
     "max-subscriptions-6",
+    "max-im-buffers-16",
     "std",
 ] }
 static_cell = "2.1.1"
