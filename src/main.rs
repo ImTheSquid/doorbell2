@@ -158,6 +158,7 @@ async fn matter() -> Result<(), anyhow::Error> {
         );
 
     let mut store = MatterBlobStore::new(nvs.clone())?;
+    store.erase_legacy_layout()?;
     stack.startup(&crypto, &mut store).await?;
     // Capture restored state before commissioning can change the fabric table.
     let had_fabric_at_start = stack.matter().has_fabrics();
