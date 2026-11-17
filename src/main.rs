@@ -269,8 +269,6 @@ impl WifiStabilityTask {
 
     async fn log_diagnostics(&self) -> Result<(), MatterError> {
         loop {
-            Timer::after_secs(DIAG_INTERVAL_SECS).await;
-
             let mut ap: sys::wifi_ap_record_t = unsafe { core::mem::zeroed() };
             let rssi = (unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) } == sys::ESP_OK)
                 .then_some(ap.rssi);
@@ -294,6 +292,8 @@ impl WifiStabilityTask {
                     );
                 }
             });
+
+            Timer::after_secs(DIAG_INTERVAL_SECS).await;
         }
     }
 

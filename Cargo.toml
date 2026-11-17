@@ -29,7 +29,10 @@ esp-idf-svc = { version = "0.53", features = [
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 embassy-futures = "0.1"
 anyhow = "1.0.102"
-esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", rev = "66da934579aa", features = [
+esp-idf-matter = { git = "https://github.com/sysgrok/esp-idf-matter.git", rev = "66da934579aa", default-features = false, features = [
+    # RustCrypto keeps PASE math off the heap; the mbedtls backend panics when a bignum allocation fails.
+    "async-io-mini",
+    "rustcrypto",
     "max-fabrics-2",
     "max-subscriptions-6",
     "max-im-buffers-16",
