@@ -1,7 +1,7 @@
 mod persist;
 
 use core::pin::pin;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select4, Either};
 use embassy_time::Timer;
 
 use persist::MatterBlobStore;
@@ -43,6 +43,7 @@ use esp_idf_svc::{
 use rs_matter::{
     dm::{clusters::gen_diag::NetifDiag, networks::NetChangeNotif},
     error::Error as MatterError,
+    transport::session::SessionMode,
     utils::select::Coalesce,
 };
 
@@ -54,6 +55,7 @@ use rs_matter::BasicCommData;
 
 const STACK_SIZE: usize = 36 * 1024;
 const BLUETOOTH_STACK_SIZE: usize = 20 * 1024;
+const DIAG_INTERVAL_SECS: u64 = 300;
 type Stack = EspWifiMatterStack<'static, BLUETOOTH_STACK_SIZE, ()>;
 
 pub const DEVICE_CONFIG: BasicInfoConfig = BasicInfoConfig {
@@ -220,14 +222,80 @@ impl UserTask for WifiStabilityTask {
             }
         }
 
-        // BLE stays owned by run_coex; fabric presence is not commissioning completion.
-        select(self.monitor_connectivity(&netif), self.run_maintenance())
-            .coalesce()
-            .await
+        select4(
+            self.monitor_connectivity(&netif),
+            self.manage_ble(),
+            self.run_maintenance(),
+            self.log_diagnostics(),
+        )
+        .coalesce()
+        .await
     }
 }
 
 impl WifiStabilityTask {
+    /// A fabric alone does not prove commissioning finished: an expired
+    /// fail-safe leaves its fabric behind. A CASE session means a controller
+    /// reached us over WiFi, so BLE is no longer needed.
+    async fn manage_ble(&self) -> Result<(), MatterError> {
+        info!("Keeping BLE up until a controller connects over CASE");
+        while !self.has_case_session() {
+            Timer::after_millis(200).await;
+        }
+        shutdown_ble();
+
+        // BLE cannot come back without a reboot, which re-pairing needs.
+        loop {
+            Timer::after_secs(5).await;
+            if !self.stack.matter().is_commissioned() {
+                warn!("No fabrics left; rebooting to re-enable BLE commissioning");
+                // Let the persister save the removal first.
+                Timer::after_secs(5).await;
+                unsafe { sys::esp_restart() };
+            }
+        }
+    }
+
+    fn has_case_session(&self) -> bool {
+        self.stack
+            .matter()
+            .transport_mgr
+            .session_mgr
+            .borrow()
+            .iter()
+            .any(|s| matches!(s.get_session_mode(), SessionMode::Case { .. }))
+    }
+
+    async fn log_diagnostics(&self) -> Result<(), MatterError> {
+        loop {
+            Timer::after_secs(DIAG_INTERVAL_SECS).await;
+
+            let mut ap: sys::wifi_ap_record_t = unsafe { core::mem::zeroed() };
+            let rssi = (unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) } == sys::ESP_OK)
+                .then_some(ap.rssi);
+            let matter = self.stack.matter();
+            let sessions = matter.transport_mgr.session_mgr.borrow();
+            info!(
+                "diag: uptime={}s heap_free={} heap_min={} heap_largest={} fabrics={} sessions={} rssi={:?}",
+                unsafe { sys::esp_timer_get_time() } / 1_000_000,
+                unsafe { sys::esp_get_free_heap_size() },
+                unsafe { sys::esp_get_minimum_free_heap_size() },
+                unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) },
+                matter.fabric_mgr.borrow().iter().count(),
+                sessions.iter().count(),
+                rssi,
+            );
+            for s in sessions.iter().filter(|s| s.is_encrypted()) {
+                info!(
+                    "diag:   session fab={} peer={:?} addr={}",
+                    s.get_local_fabric_idx(),
+                    s.get_peer_node_id(),
+                    s.get_peer_addr(),
+                );
+            }
+        }
+    }
+
     async fn monitor_connectivity<N>(&self, netif: &N) -> Result<(), MatterError>
     where
         N: NetifDiag + NetChangeNotif,
@@ -346,3 +414,18 @@ const NODE: Node = Node {
         },
     ],
 };
+
+/// Frees the BLE controller's RAM for the WiFi/LWIP TX path and gives WiFi the
+/// radio. The GATT task stays parked: it only touches BLE on indications,
+/// which need a BTP session.
+fn shutdown_ble() {
+    info!("Shutting down BLE");
+    unsafe {
+        sys::esp_bluedroid_disable();
+        sys::esp_bluedroid_deinit();
+        sys::esp_bt_controller_disable();
+        sys::esp_bt_controller_deinit();
+        sys::esp_coex_preference_set(sys::esp_coex_prefer_t_ESP_COEX_PREFER_WIFI);
+    }
+    info!("BLE shut down");
+}
