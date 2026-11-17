@@ -137,9 +137,7 @@ macro_rules! unsupported_commands {
 impl ClusterAsyncHandler for SolenoidHandler {
     const CLUSTER: rs_matter::dm::Cluster<'static> = FULL_CLUSTER
         .with_revision(7)
-        .with_attrs(with!(
-            AttributeId::LockState | AttributeId::LockType | AttributeId::AutoRelockTime
-        ))
+        .with_attrs(with!(required; AttributeId::AutoRelockTime))
         .with_cmds(with!(
             CommandId::UnlockWithTimeout | CommandId::UnlockDoor | CommandId::LockDoor
         ));
