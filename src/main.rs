@@ -51,7 +51,8 @@ use log::{error, info, warn};
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::pairing::{BasicCommData, Spake2pVerifierPassword, Spake2pVerifierPasswordRef};
 
-const STACK_SIZE: usize = 36 * 1024;
+// Futures live in the bump allocator; this holds only call frames and RustCrypto temporaries.
+const STACK_SIZE: usize = 20 * 1024;
 const BUMP_SIZE: usize = 20 * 1024 + BTP_BUMP_SIZE;
 const DIAG_INTERVAL_SECS: u64 = 300;
 type Stack = MatterStack<'static, BUMP_SIZE, EspWifiNetwork>;
@@ -269,18 +270,17 @@ impl WifiStabilityTask {
 
     async fn log_diagnostics(&self) -> Result<(), MatterError> {
         loop {
-            Timer::after_secs(DIAG_INTERVAL_SECS).await;
-
             let mut ap: sys::wifi_ap_record_t = unsafe { core::mem::zeroed() };
             let rssi = (unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) } == sys::ESP_OK)
                 .then_some(ap.rssi);
             self.stack.matter().with_state(|state| {
                 info!(
-                    "diag: uptime={}s heap_free={} heap_min={} heap_largest={} fabrics={} sessions={} rssi={:?}",
+                    "diag: uptime={}s heap_free={} heap_min={} heap_largest={} stack_min={} fabrics={} sessions={} rssi={:?}",
                     unsafe { sys::esp_timer_get_time() } / 1_000_000,
                     unsafe { sys::esp_get_free_heap_size() },
                     unsafe { sys::esp_get_minimum_free_heap_size() },
                     unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) },
+                    unsafe { sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) },
                     state.fabrics.iter().count(),
                     state.sessions.iter().count(),
                     rssi,
@@ -294,12 +294,17 @@ impl WifiStabilityTask {
                     );
                 }
             });
+
+            Timer::after_secs(DIAG_INTERVAL_SECS).await;
         }
     }
 
+    /// Polls the cached netif state. Never call `netif.wait_changed()` here: it
+    /// wakes only the first waiter to see a change, which would starve the
+    /// stack's own netif task and leave mDNS unpublished.
     async fn monitor_connectivity<N>(&self, netif: &N) -> Result<(), MatterError>
     where
-        N: NetifDiag + NetChangeNotif,
+        N: NetifDiag,
     {
         loop {
             let mut link_ready = false;
@@ -311,8 +316,7 @@ impl WifiStabilityTask {
             NetStatus::from_link(self.stack.matter().has_fabrics(), link_ready)
                 .store(&self.net_status);
 
-            // Fabric changes need not emit network events.
-            select(netif.wait_changed(), Timer::after_millis(250)).await;
+            Timer::after_millis(250).await;
         }
     }
 
