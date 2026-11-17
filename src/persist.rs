@@ -2,12 +2,12 @@ use std::ffi::CString;
 
 use esp_idf_matter::error::to_persist_error;
 use esp_idf_matter::matter::error::Error;
-use esp_idf_matter::stack::persist::KvBlobStore;
+use esp_idf_matter::matter::persist::KvBlobStore;
 use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 use esp_idf_svc::sys::{nvs_commit, nvs_set_blob, EspError};
 
-// Preserve the upstream namespace, keys and blob format for existing pairings.
+// Same namespace and key format as upstream's `EspKvBlobStore`.
 pub struct MatterBlobStore(EspDefaultNvs);
 
 impl MatterBlobStore {
@@ -17,29 +17,23 @@ impl MatterBlobStore {
 }
 
 impl KvBlobStore for MatterBlobStore {
-    async fn load<F>(&mut self, key: u16, buf: &mut [u8], cb: F) -> Result<(), Error>
-    where
-        F: FnOnce(Option<&[u8]>) -> Result<(), Error>,
-    {
-        let key = format!("{key:04x}");
-        cb(self.0.get_blob(&key, buf).map_err(to_persist_error)?)
+    fn load<'a>(&mut self, key: u16, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>, Error> {
+        self.0
+            .get_blob(&format!("{key:04x}"), buf)
+            .map_err(to_persist_error)
     }
 
-    async fn store<F>(&mut self, key: u16, buf: &mut [u8], cb: F) -> Result<(), Error>
-    where
-        F: FnOnce(&mut [u8]) -> Result<usize, Error>,
-    {
-        let len = cb(buf)?;
+    fn store(&mut self, key: u16, data: &[u8], _buf: &mut [u8]) -> Result<(), Error> {
         let handle = self.0.handle();
         let key = CString::new(format!("{key:04x}")).expect("hex key contains no NUL");
 
-        // Bypass the delete-first EspNvs wrapper. The handle, C string and buffer
+        // Bypass the delete-first EspNvs wrapper. The handle, C string and data
         // stay valid throughout both synchronous NVS calls.
-        checked(unsafe { nvs_set_blob(handle, key.as_ptr(), buf[..len].as_ptr().cast(), len) })?;
+        checked(unsafe { nvs_set_blob(handle, key.as_ptr(), data.as_ptr().cast(), data.len()) })?;
         checked(unsafe { nvs_commit(handle) })
     }
 
-    async fn remove(&mut self, key: u16, _buf: &mut [u8]) -> Result<(), Error> {
+    fn remove(&mut self, key: u16, _buf: &mut [u8]) -> Result<(), Error> {
         self.0
             .remove(&format!("{key:04x}"))
             .map(|_| ())
