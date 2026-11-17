@@ -3,9 +3,8 @@
 #![feature(const_trait_impl)]
 
 use embassy_time::Timer;
-use esp_idf_matter::matter::{import, with};
-
-import!(DoorLock);
+pub use esp_idf_matter::matter::dm::clusters::decl::door_lock;
+use esp_idf_matter::matter::with;
 use std::{
     cell::{Cell, RefCell},
     sync::{
@@ -113,7 +112,7 @@ impl SolenoidHandler {
 
     fn notify(&self, ctx: &impl HandlerContext) {
         self.dataver_changed();
-        ctx.notify_attribute_changed(
+        ctx.notify_attr_changed(
             self.endpoint_id,
             Self::CLUSTER.id,
             AttributeId::LockState as _,
