@@ -122,7 +122,6 @@ impl SolenoidHandler {
 }
 
 const UNLOCK_TIME: Duration = Duration::from_secs(5);
-const FORCE_NOTIFY_INTERVAL: Duration = UNLOCK_TIME / 2;
 
 // Required trait methods for commands this lock does not expose.
 macro_rules! unsupported_commands {
@@ -155,7 +154,6 @@ impl ClusterAsyncHandler for SolenoidHandler {
 
     async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
         self.notify(&ctx);
-        let mut last_force_notify = Instant::now();
 
         loop {
             if self.unlock_request.swap(false, Ordering::Relaxed) {
@@ -180,11 +178,6 @@ impl ClusterAsyncHandler for SolenoidHandler {
 
                 itm.0.set_level(new_relay_state).expect("set relay A");
                 itm.1.set_level(new_relay_state).expect("set relay B");
-            }
-
-            if last_force_notify.elapsed() >= FORCE_NOTIFY_INTERVAL {
-                self.notify(&ctx);
-                last_force_notify = Instant::now();
             }
 
             Timer::after_millis(100).await;
